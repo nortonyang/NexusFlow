@@ -501,7 +501,12 @@ def dashboard_html() -> str:
       --border: #e2e8f0;
       --text-main: #1e293b;
       --text-muted: #64748b;
-      --success: #10b981;
+            --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --info: #3b82f6;
+      --processing: #eab308;
+      --pending: #94a3b8;
       --warning: #f59e0b;
       --danger: #ef4444;
       --info: #3b82f6;
@@ -722,7 +727,7 @@ def dashboard_html() -> str:
     .timeline-item.success .timeline-marker svg { color: white; }
     .timeline-item.error .timeline-marker { border-color: var(--danger); background: var(--danger); }
     .timeline-item.error .timeline-marker svg { color: white; }
-    .timeline-item.info .timeline-marker { border-color: var(--info); background: #eff6ff; }
+    .timeline-item.info .timeline-marker { border-color: var(--info); background: #eff6ff; }\n    .timeline-item.processing .timeline-marker { border-color: var(--processing); background: var(--processing); }\n    .timeline-item.processing .timeline-marker svg { color: white; }
     .timeline-item.info .timeline-marker svg { color: var(--info); }
     
     .timeline-content {
@@ -958,16 +963,16 @@ def dashboard_html() -> str:
     }
 
     const STATUS_MAP = {
-      'pending': { label_key: 'status_pending', class: 'gray' },
-      'queued': { label_key: 'status_queued', class: 'gray' },
-      'dispatching': { label_key: 'status_dispatching', class: 'blue' },
-      'dispatched': { label_key: 'status_dispatched', class: 'blue' },
-      'running': { label_key: 'status_running', class: 'blue' },
-      'succeeded': { label_key: 'status_succeeded', class: 'green' },
-      'completed': { label_key: 'status_completed', class: 'green' },
-      'failed': { label_key: 'status_failed', class: 'red' },
-      'cancelling': { label_key: 'status_cancelling', class: 'orange' },
-      'cancelled': { label_key: 'status_cancelled', class: 'gray' }
+      "pending": { label_key: "status_pending", class: "gray", color: "#94a3b8" },
+      "queued": { label_key: "status_queued", class: "gray", color: "#94a3b8" },
+      "dispatching": { label_key: "status_dispatching", class: "orange", color: "#eab308" },
+      "dispatched": { label_key: "status_dispatched", class: "orange", color: "#eab308" },
+      "running": { label_key: "status_running", class: "orange", color: "#eab308" },
+      "succeeded": { label_key: "status_succeeded", class: "green", color: "#10b981" },
+      "completed": { label_key: "status_completed", class: "green", color: "#10b981" },
+      "failed": { label_key: "status_failed", class: "red", color: "#ef4444" },
+      "cancelling": { label_key: "status_cancelling", class: "orange", color: "#f59e0b" },
+      "cancelled": { label_key: "status_cancelled", class: "gray", color: "#94a3b8" }
     };
 
     function formatDate(isoStr, onlyTime = false) {
@@ -1235,34 +1240,42 @@ def dashboard_html() -> str:
       }
     }
 
-    function renderTimeline(eventsText) {
-      if (!eventsText) return `<div class="empty-hero">${t('no_events')}</div>`;
-      const lines = eventsText.trim().split('\\n');
+        function renderTimeline(eventsText) {
+      if (!eventsText) return `<div class="empty-hero">${t("no_events")}</div>`;
+      const lines = eventsText.trim().split("\n");
       
       const icons = {
         success: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg>',
         error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M18 6L6 18M6 6l12 12"/></svg>',
         info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>',
+        process: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2v4m0 12v4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83M2 12h4m12 0h4M4.93 19.07l2.83-2.83m8.48-8.48l2.83-2.83"/></svg>',
         default: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/></svg>'
       };
 
       return `<div class="timeline">` + lines.map(line => {
         try {
           const e = JSON.parse(line);
-          const evt = e.event || 'unknown';
-          let type = 'default';
+          const rawEvt = e.event || "unknown";
+          const displayTitle = t("evt_" + rawEvt) || rawEvt;
+          
+          let type = "default";
           let icon = icons.default;
           
-          if (evt.includes('succeeded') || evt.includes('completed')) { type = 'success'; icon = icons.success; }
-          else if (evt.includes('failed') || evt.includes('error')) { type = 'error'; icon = icons.error; }
-          else if (evt.includes('spawned') || evt.includes('started') || evt.includes('dispatch')) { type = 'info'; icon = icons.info; }
+          if (rawEvt.includes("succeeded") || rawEvt.includes("completed") || rawEvt.includes("finished")) { 
+            if (!rawEvt.includes("failed")) { type = "success"; icon = icons.success; }
+            else { type = "error"; icon = icons.error; }
+          }
+          else if (rawEvt.includes("failed") || rawEvt.includes("error")) { type = "error"; icon = icons.error; }
+          else if (rawEvt.includes("spawned") || rawEvt.includes("started") || rawEvt.includes("dispatch") || rawEvt.includes("ready")) { 
+            type = "processing"; icon = icons.process; 
+          }
 
-          let payloadHtml = '';
+          let payloadHtml = "";
           if (e.payload && Object.keys(e.payload).length > 0) {
             const rows = Object.entries(e.payload).map(([k, v]) => {
-              const valStr = typeof v === 'object' ? JSON.stringify(v) : String(v);
+              const valStr = typeof v === "object" ? JSON.stringify(v) : String(v);
               return `<div class="payload-row"><div class="payload-key">${escapeHtml(k)}</div><div class="payload-val">${escapeHtml(valStr)}</div></div>`;
-            }).join('');
+            }).join("");
             payloadHtml = `<div class="timeline-payload">${rows}</div>`;
           }
 
@@ -1271,7 +1284,7 @@ def dashboard_html() -> str:
               <div class="timeline-marker">${icon}</div>
               <div class="timeline-content">
                 <div class="timeline-header">
-                  <div class="timeline-title">${escapeHtml(evt)}</div>
+                  <div class="timeline-title">${escapeHtml(displayTitle)}</div>
                   <span class="timeline-time">${formatDate(e.time)}</span>
                 </div>
                 ${payloadHtml}
@@ -1281,7 +1294,7 @@ def dashboard_html() -> str:
         } catch(err) { 
            return `<div class="timeline-item"><div class="timeline-marker">${icons.default}</div><div class="timeline-content" style="font-family:monospace;font-size:12px;">${escapeHtml(line)}</div></div>`; 
         }
-      }).join('') + `</div>`;
+      }).join("") + `</div>`;
     }
 
     function calculateDuration(status) {
@@ -1415,12 +1428,15 @@ def run_attempt_with_output_timeout(
     timeout: int,
     cwd: Path | None,
 ) -> dict[str, Any]:
+    env = os.environ.copy()
+    env["PATH"] = default_child_path()
     proc = subprocess.Popen(
         command,
         stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=str(cwd) if cwd else None,
+        env=env,
         close_fds=True,
     )
     stdout_chunks: list[str] = []
