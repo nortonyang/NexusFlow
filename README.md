@@ -4,6 +4,8 @@ English | [中文](#中文说明)
 
 **NexusFlow** is a unified MCP bridge and asynchronous dispatcher for AI Agents. It allows you to connect IDE extensions (like Codex) or other LLM clients to local CLI-based AI workflows with high reliability, parallel execution, and deep visibility.
 
+> **Note**: Currently, NexusFlow is optimized for and primarily supports the connection between **Codex App** and **Gemini CLI**. Support for additional AI agents and clients is planned for future updates.
+
 Primary call chain:
 
 `Codex App` -> `MCP Client` -> `NexusFlow MCP Server` -> `async worker` -> `AI Agent (e.g. Gemini CLI)` -> `docs/ai-workflow/jobs/<job_id>/`
@@ -13,10 +15,10 @@ Primary call chain:
 ## 🚀 Key Features
 
 - **Asynchronous Execution**: Offload heavy AI tasks to background workers. Close your IDE or switch branches; the task keeps running.
-- **Pro Console (I18n)**: A built-in dashboard (English/Chinese) to monitor jobs, view live event streams, and debug output.
+- **Pro Console (I18n)**: A built-in dashboard (English/Chinese) to monitor jobs, view live event streams, and debug output in real-time.
 - **High Resilience**: Automatic retry mechanism (up to 3 times) with configurable delays to handle transient network issues.
 - **Parallel Dispatching**: Configurable concurrency (`--max-jobs`) to process multiple development tasks simultaneously.
-- **AI-Agnostic Design**: Built to bridge any CLI-based AI agent, providing a standardized MCP interface.
+- **AI-Agnostic Design**: Built with a vision to bridge any CLI-based AI agent, starting with robust native support for Gemini CLI.
 
 ---
 
@@ -25,7 +27,7 @@ Primary call chain:
 ### 1. The "Code Audit" Workflow
 Ask Codex to perform a deep audit on your project.
 *   **Action**: Codex writes a detailed task file to `docs/ai-workflow/tasks/todo/audit.md`.
-*   **NexusFlow**: Automatically picks up the task, spawns a worker, and runs your AI Agent to scan the codebase.
+*   **NexusFlow**: Automatically picks up the task, spawns a worker, and runs your AI Agent (Gemini) to scan the codebase.
 *   **Result**: You can watch the "Event Stream" in the Pro Console and review the generated `patch.patch` when finished.
 
 ### 2. Parallel Module Implementation
@@ -75,6 +77,8 @@ NexusFlow supports both CLI arguments and environment variables:
 
 **NexusFlow** 是一个统一的 MCP 桥接器和 AI Agent 异步派发引擎。它允许您将 IDE 插件（如 Codex）连接到本地的 AI 命令行工具流，并提供高可靠性、并行执行和全透明的任务监控。
 
+> **注意**：目前 NexusFlow 已针对 **Codex App** 到 **Gemini CLI** 的连接进行了深度优化和原生支持。未来计划扩展对更多 AI Agent 和客户端的支持。
+
 主链路：
 
 `Codex App` -> `MCP Client` -> `NexusFlow MCP Server` -> `异步 Worker` -> `AI Agent (如 Gemini CLI)` -> `docs/ai-workflow/jobs/<job_id>/`
@@ -87,7 +91,7 @@ NexusFlow supports both CLI arguments and environment variables:
 - **专业版控制台 (i18n)**：内置中英文双语 Dashboard，实时监控任务状态、事件流日志和输出结果。
 - **高可用性**：内置自动重试机制（默认 3 次），并可配置延迟时间，自动化应对网络波动或超时。
 - **并行派发**：可自定义并发度 (`--max-jobs`)，支持同时处理多个复杂的开发任务。
-- **通用架构**：旨在桥接任何基于 CLI 的 AI Agent（现已原生支持 Gemini CLI），提供标准化的 MCP 接口。
+- **通用架构**：旨在桥接任何基于 CLI 的 AI Agent，首发版本已完美支持 Gemini CLI。
 
 ---
 
@@ -96,7 +100,7 @@ NexusFlow supports both CLI arguments and environment variables:
 ### 1. “深度代码审计”工作流
 让 Codex 对您的整个项目进行安全审计。
 *   **操作**：Codex 在 `docs/ai-workflow/tasks/todo/audit.md` 写入审计需求。
-*   **NexusFlow**：自动识别任务并启动 Worker，驱动 AI 代理扫描代码库。
+*   **NexusFlow**：自动识别任务并启动 Worker，驱动 AI 代理（Gemini）扫描代码库。
 *   **结果**：您可以在控制台实时查看审计进度，并在完成后直接获取 `patch.patch` 补丁。
 
 ### 2. 多模块并行开发
