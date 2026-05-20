@@ -39,55 +39,44 @@ DEFAULT_CHILD_PATHS = (
 def resolve_workspace_root() -> Path:
     raw = os.getenv("GEMINI_BRIDGE_WORKSPACE") or os.getenv("CODEX_WORKSPACE")
     if raw:
-        return Path(raw).expanduser().resolve()
+        root = Path(str(raw)).expanduser().resolve()
+        if not root.exists():
+            raise ValueError(f"workspace does not exist: {root}")
+        if not root.is_dir():
+            raise ValueError(f"workspace is not a directory: {root}")
+        return root
+
     cwd = Path.cwd().resolve()
     if (cwd / ".git").exists() or (cwd / "package.json").exists() or (cwd / "pyproject.toml").exists():
         return cwd
+
     return DEFAULT_REPO_ROOT
 
 
-def resolve_workflow_relative_root() -> Path:
-    raw = os.getenv("GEMINI_BRIDGE_WORKFLOW_DIR")
-    return Path(raw) if raw else DEFAULT_WORKFLOW_RELATIVE_ROOT
-
-
 REPO_ROOT = resolve_workspace_root()
-AI_WORKFLOW_ROOT = REPO_ROOT / resolve_workflow_relative_root()
-JOBS_ROOT = AI_WORKFLOW_ROOT / "jobs"
-
-
-def registry_file_path() -> Path:
-    configured = os.getenv("GEMINI_BRIDGE_REGISTRY_FILE")
-    if configured:
-        return Path(configured).expanduser().resolve()
-    codex_home = os.getenv("CODEX_HOME")
-    root = Path(codex_home).expanduser().resolve() if codex_home else Path.home().resolve() / ".codex"
-    return root / DEFAULT_REGISTRY_RELATIVE_PATH
-
-
-def env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return default
-    return int(raw)
-
-
-def env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return default
-    return float(raw)
 
 
 def default_worker_script() -> Path:
     return Path(__file__).resolve().parents[1] / "plugins" / "gemini-bridge" / "scripts" / "gemini_bridge_mcp.py"
+
+
+def env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
+def env_bool(key: str, default: bool) -> bool:
+    val = os.getenv(key, str(default)).lower()
+    return val in {"true", "1", "yes", "on"}
+
+
+def env_float(key: str, default: float) -> float:
+    try:
+        return float(os.getenv(key, str(default)))
+    except (ValueError, TypeError):
+        return default
 
 
 def default_child_path() -> str:
@@ -132,45 +121,36 @@ class BridgeConfig:
 CONFIG = BridgeConfig()
 
 
-class BridgeError(Exception):
-    """Application-level request error."""
-
-    def __init__(self, message: str, status_code: int = HTTPStatus.BAD_REQUEST) -> None:
-        super().__init__(message)
-        self.status_code = int(status_code)
-
-
-def read_json_file(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
+def registry_file_path() -> Path:
+    configured = os.getenv("GEMINI_BRIDGE_REGISTRY_FILE")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    codex_home = os.getenv("CODEX_HOME")
+    root = Path(str(codex_home)).expanduser().resolve() if codex_home else Path.home().resolve() / ".codex"
+    return root / DEFAULT_REGISTRY_RELATIVE_PATH
 
 
 def read_registry() -> dict[str, Any]:
     path = registry_file_path()
     if not path.exists():
-        return {"projects": {}, "agents": {}, "jobs": {}}
-    data = read_json_file(path)
-    data.setdefault("projects", {})
-    data.setdefault("agents", {})
-    data.setdefault("jobs", {})
-    return data
+        return {"version": 1, "created_at": utc_now(), "updated_at": utc_now(), "projects": {}, "agents": {}, "jobs": {}}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "projects": {}, "agents": {}, "jobs": {}}
 
 
 def write_registry(registry: dict[str, Any]) -> None:
+    path = registry_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     registry["updated_at"] = utc_now()
-    write_json_atomic(registry_file_path(), registry)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(registry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def update_registry_job(job_id: str, updates: dict[str, Any]) -> dict[str, Any]:
@@ -178,162 +158,153 @@ def update_registry_job(job_id: str, updates: dict[str, Any]) -> dict[str, Any]:
     jobs = registry.setdefault("jobs", {})
     job = dict(jobs.get(job_id) or {})
     job.update(updates)
-    job["job_id"] = job_id
-    job["updated_at"] = utc_now()
     jobs[job_id] = job
     write_registry(registry)
     return job
 
 
 def platform_job_status_path(job: dict[str, Any]) -> Path:
-    status_file = job.get("status_file_abs")
-    if status_file:
-        return Path(str(status_file)).expanduser().resolve()
     workspace = Path(str(job.get("workspace") or REPO_ROOT)).expanduser().resolve()
-    workflow_dir = Path(str(job.get("workflow_dir") or DEFAULT_WORKFLOW_RELATIVE_ROOT.as_posix()))
-    return workspace / workflow_dir / "jobs" / str(job["job_id"]) / "status.json"
+    workflow_dir = str(job.get("workflow_dir") or DEFAULT_WORKFLOW_RELATIVE_ROOT.as_posix())
+    job_id = str(job.get("job_id") or "")
+    return workspace / workflow_dir / "jobs" / job_id / "status.json"
 
 
-def append_platform_job_event(job: dict[str, Any], event: str, payload: dict[str, Any] | None = None) -> None:
-    status_path = platform_job_status_path(job)
-    events_path = status_path.parent / "events.log"
-    events_path.parent.mkdir(parents=True, exist_ok=True)
-    line = {"time": utc_now(), "event": event, **(payload or {})}
-    with events_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(line, ensure_ascii=False) + "\n")
+def platform_job_events_path(job: dict[str, Any]) -> Path:
+    workspace = Path(str(job.get("workspace") or REPO_ROOT)).expanduser().resolve()
+    workflow_dir = str(job.get("workflow_dir") or DEFAULT_WORKFLOW_RELATIVE_ROOT.as_posix())
+    job_id = str(job.get("job_id") or "")
+    return workspace / workflow_dir / "jobs" / job_id / "events.log"
+
+
+def platform_job_stdout_path(job: dict[str, Any]) -> Path:
+    workspace = Path(str(job.get("workspace") or REPO_ROOT)).expanduser().resolve()
+    workflow_dir = str(job.get("workflow_dir") or DEFAULT_WORKFLOW_RELATIVE_ROOT.as_posix())
+    job_id = str(job.get("job_id") or "")
+    return workspace / workflow_dir / "jobs" / job_id / "stdout.log"
+
+
+def platform_job_stderr_path(job: dict[str, Any]) -> Path:
+    workspace = Path(str(job.get("workspace") or REPO_ROOT)).expanduser().resolve()
+    workflow_dir = str(job.get("workflow_dir") or DEFAULT_WORKFLOW_RELATIVE_ROOT.as_posix())
+    job_id = str(job.get("job_id") or "")
+    return workspace / workflow_dir / "jobs" / job_id / "stderr.log"
+
+
+def platform_job_result_path(job: dict[str, Any]) -> Path:
+    workspace = Path(str(job.get("workspace") or REPO_ROOT)).expanduser().resolve()
+    workflow_dir = str(job.get("workflow_dir") or DEFAULT_WORKFLOW_RELATIVE_ROOT.as_posix())
+    job_id = str(job.get("job_id") or "")
+    return workspace / workflow_dir / "jobs" / job_id / "result.md"
+
+
+def read_json_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def tail_file(path: Path, max_chars: int = 4000) -> str:
+    if not path.exists():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        return text[-max_chars:]
+    except Exception:
+        return ""
 
 
 def update_platform_job_status(job: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
-    status_path = platform_job_status_path(job)
-    status = read_json_file(status_path)
+    path = platform_job_status_path(job)
+    status = read_json_file(path)
     status.update(updates)
     status["updated_at"] = utc_now()
-    write_json_atomic(status_path, status)
+    write_json_file(path, status)
     return status
 
 
-def list_platform_jobs(limit: int = 50) -> list[dict[str, Any]]:
+def append_platform_job_event(job: dict[str, Any], event: str, payload: dict[str, Any] | None = None) -> None:
+    path = platform_job_events_path(job)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = {"time": utc_now(), "event": event, **(payload or {})}
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+
+def list_platform_jobs(limit: int = 500) -> list[dict[str, Any]]:
     registry = read_registry()
-    jobs: list[dict[str, Any]] = []
-    for raw_job in (registry.get("jobs") or {}).values():
-        job = dict(raw_job)
-        status = read_json_file(platform_job_status_path(job))
-        if status:
-            job["workflow_status"] = status.get("status")
-            job["returncode"] = status.get("returncode")
-            job["finished_at"] = status.get("finished_at")
-            job["launcher_pid"] = status.get("launcher_pid", job.get("launcher_pid"))
-            job["worker_pid"] = status.get("worker_pid", job.get("worker_pid"))
-        jobs.append(job)
-    jobs.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
-    return jobs[:limit]
+    jobs_map = registry.get("jobs") or {}
+    all_jobs = list(jobs_map.values())
+    all_jobs.sort(key=lambda j: str(j.get("created_at") or ""), reverse=True)
+    return all_jobs[:limit]
 
 
 def platform_job_detail(job_id: str) -> dict[str, Any] | None:
     registry = read_registry()
-    raw_job = (registry.get("jobs") or {}).get(job_id)
-    if not raw_job:
+    job = (registry.get("jobs") or {}).get(job_id)
+    if not job:
         return None
-    job = dict(raw_job)
+
     status_path = platform_job_status_path(job)
-    if not status_path.exists():
-        return {"job": job, "status": {}, "events_tail": "", "stdout_tail": "", "stderr_tail": "", "result_tail": ""}
-    job_dir = status_path.parent
+    events_path = platform_job_events_path(job)
+    stdout_path = platform_job_stdout_path(job)
+    stderr_path = platform_job_stderr_path(job)
+    result_path = platform_job_result_path(job)
+
     return {
         "job": job,
         "status": read_json_file(status_path),
-        "events_tail": tail_file(job_dir / "events.log", 8000),
-        "stdout_tail": tail_file(job_dir / "stdout.log", 8000),
-        "stderr_tail": tail_file(job_dir / "stderr.log", 8000),
-        "result_tail": tail_file(job_dir / "result.md", 8000),
-    }
-
-
-def tail_file(path: Path, max_chars: int = 8000) -> str:
-    if not path.exists():
-        return ""
-    text = path.read_text(encoding="utf-8", errors="replace")
-    return text[-max_chars:]
-
-
-def list_jobs(limit: int = 50) -> list[dict[str, Any]]:
-    if not JOBS_ROOT.exists():
-        return []
-    jobs: list[dict[str, Any]] = []
-    for status_path in sorted(JOBS_ROOT.glob("*/status.json"), key=lambda item: item.stat().st_mtime, reverse=True):
-        try:
-            jobs.append(read_json_file(status_path))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if len(jobs) >= limit:
-            break
-    return jobs
-
-
-def job_detail(job_id: str) -> dict[str, Any] | None:
-    job_dir = JOBS_ROOT / job_id
-    status_path = job_dir / "status.json"
-    if not status_path.exists():
-        return None
-    status = read_json_file(status_path)
-    return {
-        "status": status,
-        "events_tail": tail_file(job_dir / "events.log", 8000),
-        "stdout_tail": tail_file(job_dir / "stdout.log", 8000),
-        "stderr_tail": tail_file(job_dir / "stderr.log", 8000),
-        "result_tail": tail_file(job_dir / "result.md", 8000),
+        "events_tail": tail_file(events_path),
+        "stdout_tail": tail_file(stdout_path),
+        "stderr_tail": tail_file(stderr_path),
+        "result_tail": tail_file(result_path),
     }
 
 
 class GeminiJobDaemon:
-    """Local-only dispatcher that consumes queued platform jobs outside the MCP call path."""
-
     def __init__(self) -> None:
         self.enabled = CONFIG.daemon_enabled
         self.lock = threading.Lock()
-        self.stop_event = threading.Event()
-        self.thread: threading.Thread | None = None
         self.last_scan_at: str | None = None
         self.last_dispatch_at: str | None = None
         self.last_error: str | None = None
         self.dispatched_count = 0
+        self.thread: threading.Thread | None = None
 
     def start_thread(self) -> None:
         if self.thread and self.thread.is_alive():
             return
-        self.thread = threading.Thread(target=self._run, name="gemini-bridge-daemon", daemon=True)
+        self.thread = threading.Thread(target=self.run_loop, daemon=True, name="GeminiJobDaemon")
         self.thread.start()
 
     def set_enabled(self, enabled: bool) -> None:
-        self.enabled = enabled
+        with self.lock:
+            self.enabled = enabled
 
     def status(self) -> dict[str, Any]:
-        pending_jobs = [
-            job
-            for job in list_platform_jobs(limit=500)
-            if self.is_dispatchable(job)
-        ]
-        return {
-            "enabled": self.enabled,
-            "thread_alive": bool(self.thread and self.thread.is_alive()),
-            "poll_seconds": CONFIG.daemon_poll_seconds,
-            "max_jobs_per_tick": CONFIG.daemon_max_jobs_per_tick,
-            "pending_jobs": len(pending_jobs),
-            "last_scan_at": self.last_scan_at,
-            "last_dispatch_at": self.last_dispatch_at,
-            "last_error": self.last_error,
-            "dispatched_count": self.dispatched_count,
-            "worker_script": str(CONFIG.worker_script),
-        }
-
-    def _run(self) -> None:
-        while not self.stop_event.wait(CONFIG.daemon_poll_seconds):
-            if not self.enabled:
-                continue
-            try:
-                self.dispatch_pending_jobs(limit=CONFIG.daemon_max_jobs_per_tick)
-            except Exception as exc:  # pragma: no cover
-                self.last_error = str(exc)
+        with self.lock:
+            return {
+                "enabled": self.enabled,
+                "thread_alive": self.thread.is_alive() if self.thread else False,
+                "poll_seconds": CONFIG.daemon_poll_seconds,
+                "max_jobs_per_tick": CONFIG.daemon_max_jobs_per_tick,
+                "pending_jobs": len([j for j in list_platform_jobs(500) if self.is_dispatchable(j)]),
+                "last_scan_at": self.last_scan_at,
+                "last_dispatch_at": self.last_dispatch_at,
+                "last_error": self.last_error,
+                "dispatched_count": self.dispatched_count,
+                "worker_script": str(CONFIG.worker_script),
+            }
 
     @staticmethod
     def is_dispatchable(job: dict[str, Any]) -> bool:
@@ -479,19 +450,37 @@ class GeminiJobDaemon:
         self.dispatched_count += 1
         return updated_job
 
+    def run_loop(self) -> None:
+        while True:
+            try:
+                enabled = False
+                with self.lock:
+                    enabled = self.enabled
+                
+                if enabled:
+                    self.dispatch_pending_jobs(limit=CONFIG.daemon_max_jobs_per_tick)
+                else:
+                    with self.lock:
+                        self.last_scan_at = utc_now()
+            except Exception as exc:
+                with self.lock:
+                    self.last_error = str(exc)
+            
+            time.sleep(CONFIG.daemon_poll_seconds)
+
 
 DAEMON = GeminiJobDaemon()
 
 
 def dashboard_html() -> str:
-    return """<!doctype html>
+    return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Gemini Bridge Console Pro</title>
+  <title>NexusFlow Console Pro</title>
   <style>
-    :root {
+    :root {{
       --primary: #0f172a;
       --accent: #0d9488;
       --accent-light: #f0fdfa;
@@ -501,20 +490,17 @@ def dashboard_html() -> str:
       --border: #e2e8f0;
       --text-main: #1e293b;
       --text-muted: #64748b;
-            --success: #10b981;
+      --success: #10b981;
       --warning: #f59e0b;
       --danger: #ef4444;
       --info: #3b82f6;
       --processing: #eab308;
       --pending: #94a3b8;
-      --warning: #f59e0b;
-      --danger: #ef4444;
-      --info: #3b82f6;
       --font: "Inter", system-ui, -apple-system, sans-serif;
-    }
+    }}
     
-    * { box-sizing: border-box; }
-    body {
+    * {{ box-sizing: border-box; }}
+    body {{
       margin: 0;
       height: 100vh;
       display: flex;
@@ -523,10 +509,10 @@ def dashboard_html() -> str:
       background-color: var(--bg);
       color: var(--text-main);
       overflow: hidden;
-    }
+    }}
 
     /* Header Styling */
-    header {
+    header {{
       flex: 0 0 64px;
       display: flex;
       justify-content: space-between;
@@ -536,12 +522,12 @@ def dashboard_html() -> str:
       color: white;
       box-shadow: 0 1px 3px rgba(0,0,0,0.1);
       z-index: 100;
-    }
-    .logo { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 18px; letter-spacing: -0.025em; }
-    .logo-icon { width: 32px; height: 32px; background: var(--accent); border-radius: 8px; display: flex; align-items: center; justify-content: center; }
+    }}
+    .logo {{ display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 18px; letter-spacing: -0.025em; }}
+    .logo-icon {{ width: 32px; height: 32px; background: var(--accent); border-radius: 8px; display: flex; align-items: center; justify-content: center; }}
     
-    .header-actions { display: flex; align-items: center; gap: 16px; }
-    .daemon-badge {
+    .header-actions {{ display: flex; align-items: center; gap: 16px; }}
+    .daemon-badge {{
       font-size: 12px;
       padding: 4px 10px;
       border-radius: 999px;
@@ -549,26 +535,26 @@ def dashboard_html() -> str:
       display: flex;
       align-items: center;
       gap: 6px;
-    }
-    .status-dot { width: 8px; height: 8px; border-radius: 50%; }
-    .status-dot.active { background: var(--success); box-shadow: 0 0 8px var(--success); }
-    .status-dot.inactive { background: var(--danger); }
+    }}
+    .status-dot {{ width: 8px; height: 8px; border-radius: 50%; }}
+    .status-dot.active {{ background: var(--success); box-shadow: 0 0 8px var(--success); }}
+    .status-dot.inactive {{ background: var(--danger); }}
 
     /* Layout Structure */
-    main { flex: 1; display: flex; overflow: hidden; }
+    main {{ flex: 1; display: flex; overflow: hidden; }}
 
     /* Left Sidebar: Projects */
-    .sidebar {
+    .sidebar {{
       flex: 0 0 240px;
       background: var(--sidebar);
       border-right: 1px solid var(--border);
       display: flex;
       flex-direction: column;
       padding-top: 16px;
-    }
-    .sidebar-title { padding: 0 20px 12px; font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
-    .project-list { flex: 1; overflow-y: auto; padding: 0 12px; }
-    .project-item {
+    }}
+    .sidebar-title {{ padding: 0 20px 12px; font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }}
+    .project-list {{ flex: 1; overflow-y: auto; padding: 0 12px; }}
+    .project-item {{
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -580,40 +566,40 @@ def dashboard_html() -> str:
       font-weight: 500;
       color: var(--text-main);
       transition: all 0.2s;
-    }
-    .project-item:hover { background: #f1f5f9; }
-    .project-item.active { background: var(--accent-light); color: var(--accent); }
-    .project-badge { font-size: 11px; background: #e2e8f0; padding: 2px 6px; border-radius: 6px; color: var(--text-muted); }
-    .project-item.active .project-badge { background: var(--accent); color: white; }
+    }}
+    .project-item:hover {{ background: #f1f5f9; }}
+    .project-item.active {{ background: var(--accent-light); color: var(--accent); }}
+    .project-badge {{ font-size: 11px; background: #e2e8f0; padding: 2px 6px; border-radius: 6px; color: var(--text-muted); }}
+    .project-item.active .project-badge {{ background: var(--accent); color: white; }}
 
     /* Middle Column: Task Queue */
-    .queue-pane {
+    .queue-pane {{
       flex: 0 0 360px;
       background: #f8fafc;
       border-right: 1px solid var(--border);
       display: flex;
       flex-direction: column;
-    }
-    .pane-header {
+    }}
+    .pane-header {{
       padding: 16px 20px;
       border-bottom: 1px solid var(--border);
       background: white;
       display: flex;
       justify-content: space-between;
       align-items: center;
-    }
-    .pane-title { font-size: 16px; font-weight: 700; }
+    }}
+    .pane-title {{ font-size: 16px; font-weight: 700; }}
     
-    .toolbar {
+    .toolbar {{
       padding: 12px 16px;
       background: white;
       border-bottom: 1px solid var(--border);
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-    }
+    }}
     
-    button {
+    button {{
       padding: 6px 12px;
       border-radius: 6px;
       border: 1px solid var(--border);
@@ -626,14 +612,14 @@ def dashboard_html() -> str:
       display: inline-flex;
       align-items: center;
       gap: 6px;
-    }
-    button:hover { background: #f8fafc; border-color: #cbd5e1; }
-    button.primary { background: var(--accent); color: white; border-color: var(--accent); }
-    button.primary:hover { opacity: 0.9; }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    }}
+    button:hover {{ background: #f8fafc; border-color: #cbd5e1; }}
+    button.primary {{ background: var(--accent); color: white; border-color: var(--accent); }}
+    button.primary:hover {{ opacity: 0.9; }}
+    button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
 
-    .task-list { flex: 1; overflow-y: auto; padding: 16px; }
-    .task-card {
+    .task-list {{ flex: 1; overflow-y: auto; padding: 16px; }}
+    .task-card {{
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 12px;
@@ -643,39 +629,39 @@ def dashboard_html() -> str:
       transition: all 0.2s;
       position: relative;
       overflow: hidden;
-    }
-    .task-card:hover { border-color: var(--accent); box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }
-    .task-card.active { border-color: var(--accent); border-width: 2px; padding: 13px; background: var(--accent-light); }
-    .task-card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }
-    .task-name { font-weight: 700; font-size: 14px; color: var(--text-main); word-break: break-all; }
-    .task-time { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+    }}
+    .task-card:hover {{ border-color: var(--accent); box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }}
+    .task-card.active {{ border-color: var(--accent); border-width: 2px; padding: 13px; background: var(--accent-light); }}
+    .task-card-header {{ display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }}
+    .task-name {{ font-weight: 700; font-size: 14px; color: var(--text-main); word-break: break-all; }}
+    .task-time {{ font-size: 11px; color: var(--text-muted); margin-top: 4px; }}
     
-    .pill {
+    .pill {{
       font-size: 10px;
       font-weight: 700;
       padding: 2px 8px;
       border-radius: 6px;
       text-transform: uppercase;
       letter-spacing: 0.025em;
-    }
-    .pill.gray { background: #f1f5f9; color: #64748b; }
-    .pill.blue { background: #e0f2fe; color: #0284c7; }
-    .pill.green { background: #dcfce7; color: #059669; }
-    .pill.red { background: #fee2e2; color: #dc2626; }
-    .pill.orange { background: #ffedd5; color: #d97706; }
+    }}
+    .pill.gray {{ background: #f1f5f9; color: #64748b; }}
+    .pill.blue {{ background: #e0f2fe; color: #0284c7; }}
+    .pill.green {{ background: #dcfce7; color: #059669; }}
+    .pill.red {{ background: #fee2e2; color: #dc2626; }}
+    .pill.orange {{ background: #ffedd5; color: #d97706; }}
 
     /* Right Column: Details */
-    .detail-pane { flex: 1; background: white; display: flex; flex-direction: column; }
-    .detail-header { padding: 20px 24px; border-bottom: 1px solid var(--border); }
-    .detail-title-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .detail-pane {{ flex: 1; background: white; display: flex; flex-direction: column; }}
+    .detail-header {{ padding: 20px 24px; border-bottom: 1px solid var(--border); }}
+    .detail-title-row {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }}
     
-    .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
-    .stat-item { padding: 12px; background: #f8fafc; border-radius: 8px; border: 1px solid var(--border); }
-    .stat-label { font-size: 11px; color: var(--text-muted); font-weight: 600; margin-bottom: 4px; text-transform: uppercase; }
-    .stat-value { font-size: 14px; font-weight: 700; }
+    .stats-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }}
+    .stat-item {{ padding: 12px; background: #f8fafc; border-radius: 8px; border: 1px solid var(--border); }}
+    .stat-label {{ font-size: 11px; color: var(--text-muted); font-weight: 600; margin-bottom: 4px; text-transform: uppercase; }}
+    .stat-value {{ font-size: 14px; font-weight: 700; }}
 
-    .tabs { display: flex; padding: 0 24px; border-bottom: 1px solid var(--border); background: #f8fafc; }
-    .tab {
+    .tabs {{ display: flex; padding: 0 24px; border-bottom: 1px solid var(--border); background: #f8fafc; }}
+    .tab {{
       padding: 14px 16px;
       font-size: 13px;
       font-weight: 600;
@@ -683,14 +669,14 @@ def dashboard_html() -> str:
       cursor: pointer;
       border-bottom: 2px solid transparent;
       transition: all 0.2s;
-    }
-    .tab:hover { color: var(--accent); }
-    .tab.active { color: var(--accent); border-bottom-color: var(--accent); background: white; }
+    }}
+    .tab:hover {{ color: var(--accent); }}
+    .tab.active {{ color: var(--accent); border-bottom-color: var(--accent); background: white; }}
 
-    .tab-body { flex: 1; overflow-y: auto; padding: 24px; }
+    .tab-body {{ flex: 1; overflow-y: auto; padding: 24px; }}
 
     /* Code & Timeline Viewers */
-    .code-block {
+    .code-block {{
       background: #1e293b;
       color: #e2e8f0;
       padding: 16px;
@@ -702,12 +688,12 @@ def dashboard_html() -> str:
       margin: 0;
       white-space: pre-wrap;
       word-break: break-all;
-    }
+    }}
 
-    .timeline { position: relative; padding-left: 36px; padding-top: 8px; margin-top: 8px; }
-    .timeline::before { content: ''; position: absolute; left: 15px; top: 0; bottom: 0; width: 2px; background: #e2e8f0; }
-    .timeline-item { position: relative; margin-bottom: 24px; }
-    .timeline-marker {
+    .timeline {{ position: relative; padding-left: 36px; padding-top: 8px; margin-top: 8px; }}
+    .timeline::before {{ content: ''; position: absolute; left: 15px; top: 0; bottom: 0; width: 2px; background: #e2e8f0; }}
+    .timeline-item {{ position: relative; margin-bottom: 24px; }}
+    .timeline-marker {{
       position: absolute;
       left: -36px;
       top: 0;
@@ -721,38 +707,40 @@ def dashboard_html() -> str:
       justify-content: center;
       z-index: 1;
       box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-    }
-    .timeline-marker svg { width: 14px; height: 14px; color: #64748b; }
-    .timeline-item.success .timeline-marker { border-color: var(--success); background: var(--success); }
-    .timeline-item.success .timeline-marker svg { color: white; }
-    .timeline-item.error .timeline-marker { border-color: var(--danger); background: var(--danger); }
-    .timeline-item.error .timeline-marker svg { color: white; }
-    .timeline-item.info .timeline-marker { border-color: var(--info); background: #eff6ff; }\n    .timeline-item.processing .timeline-marker { border-color: var(--processing); background: var(--processing); }\n    .timeline-item.processing .timeline-marker svg { color: white; }
-    .timeline-item.info .timeline-marker svg { color: var(--info); }
+    }}
+    .timeline-marker svg {{ width: 14px; height: 14px; color: #64748b; }}
+    .timeline-item.success .timeline-marker {{ border-color: var(--success); background: var(--success); }}
+    .timeline-item.success .timeline-marker svg {{ color: white; }}
+    .timeline-item.error .timeline-marker {{ border-color: var(--danger); background: var(--danger); }}
+    .timeline-item.error .timeline-marker svg {{ color: white; }}
+    .timeline-item.info .timeline-marker {{ border-color: var(--info); background: #eff6ff; }}
+    .timeline-item.info .timeline-marker svg {{ color: var(--info); }}
+    .timeline-item.processing .timeline-marker {{ border-color: var(--processing); background: var(--processing); }}
+    .timeline-item.processing .timeline-marker svg {{ color: white; }}
     
-    .timeline-content {
+    .timeline-content {{
       background: white;
       padding: 16px;
       border-radius: 12px;
       border: 1px solid var(--border);
       box-shadow: 0 1px 3px rgba(0,0,0,0.02);
-    }
-    .timeline-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-    .timeline-title { font-weight: 700; font-size: 14px; color: var(--text-main); }
-    .timeline-time { font-size: 12px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+    }}
+    .timeline-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }}
+    .timeline-title {{ font-weight: 700; font-size: 14px; color: var(--text-main); }}
+    .timeline-time {{ font-size: 12px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }}
     
-    .timeline-payload {
+    .timeline-payload {{
       background: #f8fafc;
       border-radius: 8px;
       padding: 12px;
       border: 1px solid #f1f5f9;
-    }
-    .payload-row { display: flex; margin-bottom: 6px; font-size: 12px; }
-    .payload-row:last-child { margin-bottom: 0; }
-    .payload-key { width: 140px; flex-shrink: 0; color: var(--text-muted); font-weight: 600; }
-    .payload-val { flex: 1; color: var(--text-main); font-family: 'JetBrains Mono', monospace; word-break: break-all; }
+    }}
+    .payload-row {{ display: flex; margin-bottom: 6px; font-size: 12px; }}
+    .payload-row:last-child {{ margin-bottom: 0; }}
+    .payload-key {{ width: 140px; flex-shrink: 0; color: var(--text-muted); font-weight: 600; }}
+    .payload-val {{ flex: 1; color: var(--text-main); font-family: 'JetBrains Mono', monospace; word-break: break-all; }}
 
-    .empty-hero {
+    .empty-hero {{
       height: 100%;
       display: flex;
       flex-direction: column;
@@ -761,14 +749,14 @@ def dashboard_html() -> str:
       color: var(--text-muted);
       text-align: center;
       padding: 40px;
-    }
-    .empty-hero svg { width: 64px; height: 64px; margin-bottom: 20px; color: #cbd5e1; }
+    }}
+    .empty-hero svg {{ width: 64px; height: 64px; margin-bottom: 20px; color: #cbd5e1; }}
 
     /* Scrollbar */
-    ::-webkit-scrollbar { width: 6px; height: 6px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
-    ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
+    ::-webkit-scrollbar-track {{ background: transparent; }}
+    ::-webkit-scrollbar-thumb {{ background: #cbd5e1; border-radius: 3px; }}
+    ::-webkit-scrollbar-thumb:hover {{ background: #94a3b8; }}
   </style>
 </head>
 <body>
@@ -824,8 +812,8 @@ def dashboard_html() -> str:
   </main>
 
   <script>
-    const TRANSLATIONS = {
-      'zh': {
+    const TRANSLATIONS = {{
+      'zh': {{
         'refresh': '刷新',
         'projects': '项目分组',
         'queue': '任务队列',
@@ -871,9 +859,20 @@ def dashboard_html() -> str:
         'status_completed': '已完成',
         'status_failed': '已失败',
         'status_cancelling': '取消中',
-        'status_cancelled': '已取消'
-      },
-      'en': {
+        'status_cancelled': '已取消',
+        'evt_job_created': '任务已创建',
+        'evt_daemon_dispatch_started': '后台派发启动',
+        'evt_daemon_dispatch_retry': '后台重试派发',
+        'evt_daemon_worker_spawned': '工作进程已启动',
+        'evt_worker_started': 'Worker 开始执行',
+        'evt_gemini_prompt_ready': '提示词已就绪',
+        'evt_gemini_attempt_started': 'Gemini 尝试开始',
+        'evt_gemini_attempt_finished': 'Gemini 尝试结束',
+        'evt_patch_capture_skipped': '补丁捕获跳过',
+        'evt_worker_finished': 'Worker 执行结束',
+        'evt_unknown': '未知事件'
+      }},
+      'en': {{
         'refresh': 'Refresh',
         'projects': 'Projects',
         'queue': 'Task Queue',
@@ -919,65 +918,68 @@ def dashboard_html() -> str:
         'status_completed': 'Completed',
         'status_failed': 'Failed',
         'status_cancelling': 'Cancelling',
-        'status_cancelled': 'Cancelled'
-      }
-    };
+        'status_cancelled': 'Cancelled',
+        'evt_job_created': 'Job Created',
+        'evt_daemon_dispatch_started': 'Daemon Dispatch Started',
+        'evt_daemon_dispatch_retry': 'Daemon Dispatch Retry',
+        'evt_daemon_worker_spawned': 'Worker Process Spawned',
+        'evt_worker_started': 'Worker Started',
+        'evt_gemini_prompt_ready': 'Prompt Ready',
+        'evt_gemini_attempt_started': 'Gemini Attempt Started',
+        'evt_gemini_attempt_finished': 'Gemini Attempt Finished',
+        'evt_patch_capture_skipped': 'Patch Capture Skipped',
+        'evt_worker_finished': 'Worker Finished',
+        'evt_unknown': 'Unknown Event'
+      }}
+    }};
 
-    let state = {
+    let state = {{
       lang: localStorage.getItem('lang') || (navigator.language.startsWith('zh') ? 'zh' : 'en'),
-      projects: {},
+      projects: {{}},
       jobs: [],
       selectedProject: null,
       selectedJobId: null,
       jobDetail: null,
       activeTab: 'Overview',
-      daemon: {},
+      daemon: {{}},
       logOffset: 0,
       logContent: ""
-    };
+    }};
 
-    function t(key) {
+    function t(key) {{
       return (TRANSLATIONS[state.lang] || TRANSLATIONS['en'])[key] || key;
-    }
+    }}
 
-    function toggleLang() {
+    function toggleLang() {{
       state.lang = state.lang === 'zh' ? 'en' : 'zh';
       localStorage.setItem('lang', state.lang);
       // Update tab names if they are currently set to translated versions
-      const tabMap = {
-          '概览': 'tab_overview', 'Overview': 'tab_overview',
-          '事件流': 'tab_events', 'Events': 'tab_events',
-          '提示词': 'tab_prompt', 'Prompt': 'tab_prompt',
-          '控制台输出': 'tab_console', 'Console': 'tab_console',
-          '结果补丁': 'tab_patch', 'Patch': 'tab_patch',
-          '原始 JSON': 'tab_json', 'Raw JSON': 'tab_json'
-      };
       const currentKey = Object.entries(TRANSLATIONS['zh']).find(([k,v]) => v === state.activeTab)?.[0] || 
                          Object.entries(TRANSLATIONS['en']).find(([k,v]) => v === state.activeTab)?.[0];
-      if (currentKey) {
+      if (currentKey) {{
           state.activeTab = t(currentKey);
-      } else {
+      }} else {{
           state.activeTab = t('tab_overview');
-      }
+      }}
       render();
-    }
+    }}
 
-    const STATUS_MAP = {
-      "pending": { label_key: "status_pending", class: "gray", color: "#94a3b8" },
-      "queued": { label_key: "status_queued", class: "gray", color: "#94a3b8" },
-      "dispatching": { label_key: "status_dispatching", class: "orange", color: "#eab308" },
-      "dispatched": { label_key: "status_dispatched", class: "orange", color: "#eab308" },
-      "running": { label_key: "status_running", class: "orange", color: "#eab308" },
-      "succeeded": { label_key: "status_succeeded", class: "green", color: "#10b981" },
-      "completed": { label_key: "status_completed", class: "green", color: "#10b981" },
-      "failed": { label_key: "status_failed", class: "red", color: "#ef4444" },
-      "cancelling": { label_key: "status_cancelling", class: "orange", color: "#f59e0b" },
-      "cancelled": { label_key: "status_cancelled", class: "gray", color: "#94a3b8" }
-    };
+    const STATUS_MAP = {{
+      "pending": {{ label_key: "status_pending", class: "gray", color: "#94a3b8" }},
+      "queued": {{ label_key: "status_queued", class: "gray", color: "#94a3b8" }},
+      "dispatching": {{ label_key: "status_dispatching", class: "orange", color: "#eab308" }},
+      "dispatched": {{ label_key: "status_dispatched", class: "orange", color: "#eab308" }},
+      "running": {{ label_key: "status_running", class: "orange", color: "#eab308" }},
+      "succeeded": {{ label_key: "status_succeeded", class: "green", color: "#10b981" }},
+      "completed": {{ label_key: "status_completed", class: "green", color: "#10b981" }},
+      "failed": {{ label_key: "status_failed", class: "red", color: "#ef4444" }},
+      "cancelling": {{ label_key: "status_cancelling", class: "orange", color: "#f59e0b" }},
+      "cancelled": {{ label_key: "status_cancelled", class: "gray", color: "#94a3b8" }}
+    }};
 
-    function formatDate(isoStr, onlyTime = false) {
+    function formatDate(isoStr, onlyTime = false) {{
       if (!isoStr || isoStr === '-') return '-';
-      try {
+      try {{
         const date = new Date(isoStr);
         if (isNaN(date.getTime())) return isoStr;
         const pad = (n) => String(n).padStart(2, '0');
@@ -987,105 +989,109 @@ def dashboard_html() -> str:
         const h = pad(date.getHours());
         const m = pad(date.getMinutes());
         const s = pad(date.getSeconds());
-        return onlyTime ? `${h}:${m}:${s}` : `${Y}-${M}-${D} ${h}:${m}:${s}`;
-      } catch (e) { return isoStr; }
-    }
+        return onlyTime ? `${{h}}:${{m}}:${{s}}` : `${{Y}}-${{M}}-${{D}} ${{h}}:${{m}}:${{s}}`;
+      }} catch (e) {{ return isoStr; }}
+    }}
 
-    function normalize(job) {
+    function normalize(job) {{
       const status = job.workflow_status || job.dispatch_status || job.status || 'pending';
-      return {
+      return {{
         jobId: job.job_id || '-',
         projectId: job.projectId || job.project_id || job.project || t('default_project'),
         taskId: job.taskId || job.task_id || '-',
         status: status,
         updatedAt: job.updated_at || job.created_at || '-',
-      };
-    }
+      }};
+    }}
 
-    async function refreshAll() {
-      try {
+    async function refreshAll() {{
+      try {{
         await Promise.all([refreshRegistry(), refreshDaemon(), refreshJobs()]);
-        if (state.selectedJobId && state.activeTab === t("tab_console")) {
+        if (state.selectedJobId && state.activeTab === t("tab_console")) {{
             await fetchIncrementalLogs();
-        }
+        }}
         render();
-      } catch (e) { console.error('Refresh failed', e); }
-    }
+      }} catch (e) {{ console.error('Refresh failed', e); }}
+    }}
 
-    async function refreshRegistry() {
+    async function refreshRegistry() {{
       const res = await fetch('/registry');
       const data = await res.json();
-      state.projects = data.registry?.projects || {};
-    }
+      state.projects = data.registry?.projects || {{}};
+    }}
 
-    async function refreshDaemon() {
+    async function refreshDaemon() {{
       const res = await fetch('/daemon/status');
       const data = await res.json();
-      state.daemon = data.daemon || {};
-    }
+      state.daemon = data.daemon || {{}};
+    }}
 
-    async function refreshJobs() {
+    async function refreshJobs() {{
       const res = await fetch('/platform-jobs');
       const data = await res.json();
       state.jobs = (data.jobs || []).map(normalize);
       
       const uniqueProjects = [...new Set(state.jobs.map(j => j.projectId))];
-      if (!state.selectedProject && uniqueProjects.length > 0) {
+      if (!state.selectedProject && uniqueProjects.length > 0) {{
         state.selectedProject = uniqueProjects[0];
-      }
-    }
+      }}
+    }}
 
-    async function selectJob(jobId) {
+    async function selectJob(jobId) {{
       state.selectedJobId = jobId;
       state.jobDetail = null;
       state.logOffset = 0;
       state.logContent = "";
       render();
       
-      const res = await fetch(`/platform-jobs/${jobId}`);
-      if (res.ok) {
+      const res = await fetch(`/platform-jobs/${{jobId}}`);
+      if (res.ok) {{
         state.jobDetail = await res.json();
         render();
-      }
-    }
+        // Trigger initial log fetch if Console tab is active
+        if (state.activeTab === t('tab_console')) {{
+            await fetchIncrementalLogs();
+        }}
+      }}
+    }}
 
-    async function fetchIncrementalLogs() {
-      if (!state.selectedJobId || state.activeTab !== t(tab_console)) return;
-      try {
-        const res = await fetch(`/platform-jobs/${state.selectedJobId}/logs?offset=${state.logOffset}`);
+    async function fetchIncrementalLogs() {{
+      if (!state.selectedJobId || state.activeTab !== t('tab_console')) return;
+      try {{
+        const res = await fetch(`/platform-jobs/${{state.selectedJobId}}/logs?offset=${{state.logOffset}}`);
         const data = await res.json();
-        if (data.ok && (data.content || data.offset > state.logOffset)) {
+        if (data.ok && (data.content || data.offset > state.logOffset)) {{
           state.logContent += data.content || "";
           state.logOffset = data.offset;
           const codeBlock = document.getElementById("log-code-block");
-          if (codeBlock) {
+          if (codeBlock) {{
             codeBlock.textContent = state.logContent;
             codeBlock.scrollTop = codeBlock.scrollHeight;
-          }
-        }
-      } catch (e) { console.error("Log fetch failed", e); }
-    }
+          }}
+        }}
+      }} catch (e) {{ console.error("Log fetch failed", e); }}
+    }}
 
-    async function postAction(path) {
-      const res = await fetch(path, { method: 'POST' });
-      if (!res.ok) {
+    async function postAction(path) {{
+      const res = await fetch(path, {{ method: 'POST' }});
+      if (!res.ok) {{
         const data = await res.json();
-        alert(state.lang === 'zh' ? `操作失败: ${data.error || res.statusText}` : `Action failed: ${data.error || res.statusText}`);
-      }
+        alert(state.lang === 'zh' ? `操作失败: ${{data.error || res.statusText}}` : `Action failed: ${{data.error || res.statusText}}`);
+      }}
       await refreshAll();
-    }
+    }}
 
-    async function dispatchSelected() {
-      if (state.selectedJobId) {
-        await postAction(`/daemon/dispatch/${state.selectedJobId}`);
-      }
-    }
+    async function dispatchSelected() {{
+      if (state.selectedJobId) {{
+        await postAction(`/daemon/dispatch/${{state.selectedJobId}}`);
+      }}
+    }}
 
-    function render() {
-      const projName = state.selectedProject || 'NexusFlow';
-      document.title = state.lang === 'zh' ? `${projName} 控制台` : `${projName} Console`;
-      const headerTitle = document.getElementById('header-project-name');
-      if (headerTitle) headerTitle.textContent = `${projName} Console Pro`;
+    function render() {{
+      const projName = state.selectedProject || "NexusFlow";
+      document.title = state.lang === "zh" ? `${{projName}} 控制台` : `${{projName}} Console`;
+      const headerTitle = document.getElementById("header-project-name");
+      if (headerTitle) headerTitle.textContent = `${{projName}} Console Pro`;
 
       document.getElementById('btn-refresh-text').textContent = t('refresh');
       document.getElementById('sidebar-title').textContent = t('projects');
@@ -1104,156 +1110,156 @@ def dashboard_html() -> str:
       renderProjects();
       renderTasks();
       renderDetail();
-    }
+    }}
 
-    function renderDaemon() {
+    function renderDaemon() {{
       const d = state.daemon;
       const dot = document.getElementById('daemon-dot');
       dot.className = 'status-dot ' + (d.enabled ? 'active' : 'inactive');
       document.getElementById('daemon-summary').textContent = 
-        `${d.enabled ? t('daemon_active') : t('daemon_inactive')} · ${t('pending_jobs')} ${d.pending_jobs || 0}`;
+        `${{d.enabled ? t('daemon_active') : t('daemon_inactive')}} · ${{t('pending_jobs')}} ${{d.pending_jobs || 0}}`;
       document.getElementById('btn-start').disabled = d.enabled;
       document.getElementById('btn-stop').disabled = !d.enabled;
-    }
+    }}
 
-    function renderProjects() {
-      const counts = {};
-      state.jobs.forEach(j => { counts[j.projectId] = (counts[j.projectId] || 0) + 1; });
+    function renderProjects() {{
+      const counts = {{}};
+      state.jobs.forEach(j => {{ counts[j.projectId] = (counts[j.projectId] || 0) + 1; }});
       const container = document.getElementById('project-list');
       const projects = Object.keys(counts).sort();
       
-      if (projects.length === 0) {
-        container.innerHTML = `<div style="padding:20px; text-align:center; color:var(--text-muted); font-size:13px;">${t('no_project')}</div>`;
+      if (projects.length === 0) {{
+        container.innerHTML = `<div style="padding:20px; text-align:center; color:var(--text-muted); font-size:13px;">${{t('no_project')}}</div>`;
         return;
-      }
+      }}
 
       container.innerHTML = projects.map(p => `
-        <div class="project-item ${state.selectedProject === p ? 'active' : ''}" onclick="state.selectedProject='${p}'; render();">
-          <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${p}</span>
-          <span class="project-badge">${counts[p]}</span>
+        <div class="project-item ${{state.selectedProject === p ? 'active' : ''}}" onclick="state.selectedProject='${{p}}'; render();">
+          <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${{p}}</span>
+          <span class="project-badge">${{counts[p]}}</span>
         </div>
       `).join('');
-    }
+    }}
 
-    function renderTasks() {
+    function renderTasks() {{
       const tasks = state.jobs.filter(j => j.projectId === state.selectedProject);
       const container = document.getElementById('task-list');
       document.getElementById('queue-count').textContent = tasks.length;
 
-      if (tasks.length === 0) {
-        container.innerHTML = `<div class="empty-hero" style="padding-top:100px;">${t('no_task_in_project')}</div>`;
+      if (tasks.length === 0) {{
+        container.innerHTML = `<div class="empty-hero" style="padding-top:100px;">${{t('no_task_in_project')}}</div>`;
         return;
-      }
+      }}
 
-      container.innerHTML = tasks.map(t_obj => {
+      container.innerHTML = tasks.map(t_obj => {{
         const s = STATUS_MAP[t_obj.status] || STATUS_MAP.pending;
         return `
-          <div class="task-card ${state.selectedJobId === t_obj.jobId ? 'active' : ''}" onclick="selectJob('${t_obj.jobId}')">
+          <div class="task-card ${{state.selectedJobId === t_obj.jobId ? 'active' : ''}}" onclick="selectJob('${{t_obj.jobId}}')">
             <div class="task-card-header">
-              <div class="task-name">${t_obj.jobId}</div>
-              <span class="pill ${s.class}">${t(s.label_key)}</span>
+              <div class="task-name">${{t_obj.jobId}}</div>
+              <span class="pill" style="background:${{s.color}}; color:white;">${{t(s.label_key)}}</span>
             </div>
-            <div class="task-time">${formatDate(t_obj.updatedAt, true)} · ${t_obj.taskId}</div>
+            <div class="task-time">${{formatDate(t_obj.updatedAt, true)}} · ${{t_obj.taskId}}</div>
           </div>
         `;
-      }).join('');
+      }}).join('');
       
       document.getElementById('btn-dispatch-selected').disabled = !state.selectedJobId;
-    }
+    }}
 
-    function renderDetail() {
+    function renderDetail() {{
       const container = document.getElementById('detail-pane');
       if (!state.selectedJobId) return; // Empty hero already there
       
-      if (!state.jobDetail) {
-        container.innerHTML = `<div class="empty-hero"><div style="animation:pulse 1.5s infinite;">${t('loading_detail')}</div></div>`;
+      if (!state.jobDetail) {{
+        container.innerHTML = `<div class="empty-hero"><div style="animation:pulse 1.5s infinite;">${{t('loading_detail')}}</div></div>`;
         return;
-      }
+      }}
 
       const d = state.jobDetail;
-      const job = d.job || {};
-      const status = d.status || {};
+      const job = d.job || {{}};
+      const status = d.status || {{}};
       const s = STATUS_MAP[status.status || job.status || 'pending'] || STATUS_MAP.pending;
 
       const tabs = [
-          { key: 'tab_overview', label: t('tab_overview') },
-          { key: 'tab_events', label: t('tab_events') },
-          { key: 'tab_prompt', label: t('tab_prompt') },
-          { key: 'tab_console', label: t('tab_console') },
-          { key: 'tab_patch', label: t('tab_patch') },
-          { key: 'tab_json', label: t('tab_json') }
+          {{ key: 'tab_overview', label: t('tab_overview') }},
+          {{ key: 'tab_events', label: t('tab_events') }},
+          {{ key: 'tab_prompt', label: t('tab_prompt') }},
+          {{ key: 'tab_console', label: t('tab_console') }},
+          {{ key: 'tab_patch', label: t('tab_patch') }},
+          {{ key: 'tab_json', label: t('tab_json') }}
       ];
 
       container.innerHTML = `
         <div class="detail-header">
           <div class="detail-title-row">
             <div>
-              <div style="font-size:12px; color:var(--text-muted); font-weight:600; text-transform:uppercase;">${t('task_detail')}</div>
-              <div style="font-size:20px; font-weight:800; margin-top:4px;">${job.job_id}</div>
+              <div style="font-size:12px; color:var(--text-muted); font-weight:600; text-transform:uppercase;">${{t('task_detail')}}</div>
+              <div style="font-size:20px; font-weight:800; margin-top:4px;">${{job.job_id}}</div>
             </div>
-            <span class="pill ${s.class}" style="font-size:12px; padding:4px 12px;">${t(s.label_key)}</span>
+            <span class="pill" style="font-size:12px; padding:4px 12px; background:${{s.color}}; color:white;">${{t(s.label_key)}}</span>
           </div>
           <div class="stats-grid">
-            <div class="stat-item"><div class="stat-label">${t('task_id')}</div><div class="stat-value">${status.task_id || job.taskId || '-'}</div></div>
-            <div class="stat-item"><div class="stat-label">${t('exit_status')}</div><div class="stat-value">${status.returncode ?? t('running')}</div></div>
-            <div class="stat-item"><div class="stat-label">${t('duration')}</div><div class="stat-value">${calculateDuration(status)}</div></div>
-            <div class="stat-item"><div class="stat-label">${t('updated_at')}</div><div class="stat-value">${formatDate(status.updated_at, true)}</div></div>
+            <div class="stat-item"><div class="stat-label">${{t('task_id')}}</div><div class="stat-value">${{status.task_id || job.taskId || '-'}}</div></div>
+            <div class="stat-item"><div class="stat-label">${{t('exit_status')}}</div><div class="stat-value">${{status.returncode ?? t('running')}}</div></div>
+            <div class="stat-item"><div class="stat-label">${{t('duration')}}</div><div class="stat-value">${{calculateDuration(status)}}</div></div>
+            <div class="stat-item"><div class="stat-label">${{t('updated_at')}}</div><div class="stat-value">${{formatDate(status.updated_at, true)}}</div></div>
           </div>
         </div>
         <div class="tabs">
-          ${tabs.map(tab => `
-            <div class="tab ${state.activeTab === tab.label ? 'active' : ''}" onclick="state.activeTab='${tab.label}'; renderDetail();">${tab.label}</div>
-          `).join('')}
+          ${{tabs.map(tab => `
+            <div class="tab ${{state.activeTab === tab.label ? 'active' : ''}}" onclick="state.activeTab='${{tab.label}}'; renderDetail();">${{tab.label}}</div>
+          `).join('')}}
         </div>
         <div class="tab-body">
-          ${renderTabContent(state.activeTab, d)}
+          ${{renderTabContent(state.activeTab, d)}}
         </div>
       `;
-    }
+    }}
 
-    function renderTabContent(tabLabel, data) {
+    function renderTabContent(tabLabel, data) {{
       const tabKey = Object.entries(TRANSLATIONS[state.lang]).find(([k,v]) => v === tabLabel)?.[0] || 
                      Object.entries(TRANSLATIONS['en']).find(([k,v]) => v === tabLabel)?.[0] ||
                      Object.entries(TRANSLATIONS['zh']).find(([k,v]) => v === tabLabel)?.[0];
       
-      switch(tabKey) {
+      switch(tabKey) {{
         case 'tab_overview':
           return `
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
-              <div class="stat-item"><div class="stat-label">${t('created_at')}</div><div class="stat-value">${formatDate(data.status?.created_at || data.job?.created_at)}</div></div>
-              <div class="stat-item"><div class="stat-label">${t('finished_at')}</div><div class="stat-value">${formatDate(data.status?.finished_at)}</div></div>
-              <div class="stat-item" style="grid-column: span 2;"><div class="stat-label">${t('workspace')}</div><div class="stat-value" style="word-break:break-all;">${data.job?.workspace || '-'}</div></div>
-              <div class="stat-item" style="grid-column: span 2;"><div class="stat-label">${t('command')}</div><div class="stat-value" style="word-break:break-all; font-family:monospace;">${data.status?.worker_command?.join(' ') || '-'}</div></div>
+              <div class="stat-item"><div class="stat-label">${{t('created_at')}}</div><div class="stat-value">${{formatDate(data.status?.created_at || data.job?.created_at)}}</div></div>
+              <div class="stat-item"><div class="stat-label">${{t('finished_at')}}</div><div class="stat-value">${{formatDate(data.status?.finished_at)}}</div></div>
+              <div class="stat-item" style="grid-column: span 2;"><div class="stat-label">${{t('workspace')}}</div><div class="stat-value" style="word-break:break-all;">${{data.job?.workspace || '-'}}</div></div>
+              <div class="stat-item" style="grid-column: span 2;"><div class="stat-label">${{t('command')}}</div><div class="stat-value" style="word-break:break-all; font-family:monospace;">${{data.status?.worker_command?.join(' ') || '-'}}</div></div>
             </div>
           `;
         case 'tab_events':
           return renderTimeline(data.events_tail);
         case 'tab_prompt':
-          return `<pre class="code-block">${escapeHtml(data.status?.prompt || data.job?.prompt || '-')}</pre>`;
+          return `<pre class="code-block">${{escapeHtml(data.status?.prompt || data.job?.prompt || '-')}}</pre>`;
         case 'tab_console':
-          return `<pre id="log-code-block" class="code-block" style="height:500px; overflow-y:auto;">${escapeHtml(state.logContent || t('no_output'))}</pre>`;
+          return `<pre id="log-code-block" class="code-block" style="height:500px; overflow-y:auto;">${{escapeHtml(state.logContent || t('no_output'))}}</pre>`;
         case 'tab_patch':
-          return `<pre class="code-block">${escapeHtml(data.result_tail || t('no_result'))}</pre>`;
+          return `<pre class="code-block">${{escapeHtml(data.result_tail || t('no_result'))}}</pre>`;
         case 'tab_json':
-          return `<pre class="code-block">${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
+          return `<pre class="code-block">${{escapeHtml(JSON.stringify(data, null, 2))}}</pre>`;
         default: return '';
-      }
-    }
+      }}
+    }}
 
-        function renderTimeline(eventsText) {
-      if (!eventsText) return `<div class="empty-hero">${t("no_events")}</div>`;
-      const lines = eventsText.trim().split("\n");
+    function renderTimeline(eventsText) {{
+      if (!eventsText) return `<div class="empty-hero">${{t("no_events")}}</div>`;
+      const lines = eventsText.trim().split('\\n');
       
-      const icons = {
+      const icons = {{
         success: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg>',
         error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M18 6L6 18M6 6l12 12"/></svg>',
         info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>',
         process: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2v4m0 12v4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83M2 12h4m12 0h4M4.93 19.07l2.83-2.83m8.48-8.48l2.83-2.83"/></svg>',
         default: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/></svg>'
-      };
+      }};
 
-      return `<div class="timeline">` + lines.map(line => {
-        try {
+      return `<div class="timeline">` + lines.map(line => {{
+        try {{
           const e = JSON.parse(line);
           const rawEvt = e.event || "unknown";
           const displayTitle = t("evt_" + rawEvt) || rawEvt;
@@ -1261,52 +1267,52 @@ def dashboard_html() -> str:
           let type = "default";
           let icon = icons.default;
           
-          if (rawEvt.includes("succeeded") || rawEvt.includes("completed") || rawEvt.includes("finished")) { 
-            if (!rawEvt.includes("failed")) { type = "success"; icon = icons.success; }
-            else { type = "error"; icon = icons.error; }
-          }
-          else if (rawEvt.includes("failed") || rawEvt.includes("error")) { type = "error"; icon = icons.error; }
-          else if (rawEvt.includes("spawned") || rawEvt.includes("started") || rawEvt.includes("dispatch") || rawEvt.includes("ready")) { 
+          if (rawEvt.includes("succeeded") || rawEvt.includes("completed") || rawEvt.includes("finished")) {{ 
+            if (!rawEvt.includes("failed")) {{ type = "success"; icon = icons.success; }}
+            else {{ type = "error"; icon = icons.error; }}
+          }}
+          else if (rawEvt.includes("failed") || rawEvt.includes("error")) {{ type = "error"; icon = icons.error; }}
+          else if (rawEvt.includes("spawned") || rawEvt.includes("started") || rawEvt.includes("dispatch") || rawEvt.includes("ready")) {{ 
             type = "processing"; icon = icons.process; 
-          }
+          }}
 
           let payloadHtml = "";
-          if (e.payload && Object.keys(e.payload).length > 0) {
-            const rows = Object.entries(e.payload).map(([k, v]) => {
+          if (e.payload && Object.keys(e.payload).length > 0) {{
+            const rows = Object.entries(e.payload).map(([k, v]) => {{
               const valStr = typeof v === "object" ? JSON.stringify(v) : String(v);
-              return `<div class="payload-row"><div class="payload-key">${escapeHtml(k)}</div><div class="payload-val">${escapeHtml(valStr)}</div></div>`;
-            }).join("");
-            payloadHtml = `<div class="timeline-payload">${rows}</div>`;
+              return `<div class="payload-row"><div class="payload-key">${{escapeHtml(k)}}</div><div class="payload-val">${{escapeHtml(valStr)}}</div></div>`;
+            }}).join("");
+            payloadHtml = `<div class="timeline-payload">${{rows}}</div>`;
           }
 
           return `
-            <div class="timeline-item ${type}">
-              <div class="timeline-marker">${icon}</div>
+            <div class="timeline-item ${{type}}">
+              <div class="timeline-marker">${{icon}}</div>
               <div class="timeline-content">
                 <div class="timeline-header">
-                  <div class="timeline-title">${escapeHtml(displayTitle)}</div>
-                  <span class="timeline-time">${formatDate(e.time)}</span>
+                  <div class="timeline-title">${{escapeHtml(displayTitle)}}</div>
+                  <span class="timeline-time">${{formatDate(e.time)}}</span>
                 </div>
-                ${payloadHtml}
+                ${{payloadHtml}}
               </div>
             </div>
           `;
-        } catch(err) { 
-           return `<div class="timeline-item"><div class="timeline-marker">${icons.default}</div><div class="timeline-content" style="font-family:monospace;font-size:12px;">${escapeHtml(line)}</div></div>`; 
-        }
-      }).join("") + `</div>`;
-    }
+        }} catch(err) {{ 
+           return `<div class="timeline-item"><div class="timeline-marker">${{icons.default}}</div><div class="timeline-content" style="font-family:monospace;font-size:12px;">${{escapeHtml(line)}}</div></div>`; 
+        }}
+      }}).join("") + `</div>`;
+    }}
 
-    function calculateDuration(status) {
+    function calculateDuration(status) {{
       if (!status.started_at || !status.finished_at) return '-';
       const diff = Math.floor((new Date(status.finished_at) - new Date(status.started_at)) / 1000);
       return diff < 0 ? '-' : diff + 's';
-    }
+    }}
 
-    function escapeHtml(value) {
+    function escapeHtml(value) {{
       if (!value) return '';
-      return String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', "'":'&#39;'}[char]));
-    }
+      return String(value).replace(/[&<>"']/g, char => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', "'":'&#39;'}}[char]));
+    }}
 
     refreshAll();
     setInterval(refreshAll, 5000);
@@ -1315,319 +1321,37 @@ def dashboard_html() -> str:
 </html>"""
 
 
-
-
-def build_payload(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
-    parsed = urlparse(handler.path)
-    if parsed.path == "/health":
-        return {}
-
-    payload: dict[str, Any] = {}
-    if handler.command == "GET":
-        query = parse_qs(parsed.query)
-        if "prompt" in query:
-            payload["prompt"] = query["prompt"][0]
-        if "timeout" in query:
-            payload["timeout"] = query["timeout"][0]
-        if "cwd" in query:
-            payload["cwd"] = query["cwd"][0]
-        return payload
-
-    length = int(handler.headers.get("content-length", "0"))
-    raw_body = handler.rfile.read(length) if length else b""
-    if not raw_body:
-        return payload
-    try:
-        decoded = json.loads(raw_body.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise BridgeError(f"Invalid JSON body: {exc}") from exc
-    if not isinstance(decoded, dict):
-        raise BridgeError("JSON body must be an object.")
-    return decoded
-
-
-def normalize_request(payload: dict[str, Any]) -> tuple[str, int, Path | None]:
-    prompt = str(payload.get("prompt", "")).strip()
-    if not prompt:
-        raise BridgeError("Missing required field: prompt")
-
-    timeout = payload.get("timeout", CONFIG.default_timeout)
-    try:
-        timeout_int = int(timeout)
-    except (TypeError, ValueError) as exc:
-        raise BridgeError("timeout must be an integer") from exc
-    if timeout_int <= 0:
-        raise BridgeError("timeout must be a positive integer")
-
-    cwd_raw = payload.get("cwd")
-    cwd_path: Path | None = None
-    if cwd_raw:
-        cwd_path = Path(str(cwd_raw)).expanduser().resolve()
-        if not cwd_path.exists():
-            raise BridgeError(f"cwd does not exist: {cwd_path}")
-        if not cwd_path.is_dir():
-            raise BridgeError(f"cwd is not a directory: {cwd_path}")
-
-    return prompt, timeout_int, cwd_path
-
-
-def default_gemini_model() -> str:
-    configured = (os.getenv("GEMINI_DEFAULT_MODEL") or "").strip()
-    return configured or DEFAULT_GEMINI_MODEL
-
-
-def has_model_arg(args: list[str]) -> bool:
-    return any(
-        arg in {"--model", "-m"} or arg.startswith("--model=") or arg.startswith("-m=")
-        for arg in args
-    )
-
-
-def with_default_model(args: list[str]) -> list[str]:
-    if has_model_arg(args):
-        return args
-    return ["--model", default_gemini_model(), *args]
-
-
-def has_approval_mode_arg(args: list[str]) -> bool:
-    return any(
-        arg == "--approval-mode" or arg.startswith("--approval-mode=") or arg in {"-y", "--yolo"}
-        for arg in args
-    )
-
-
-def with_default_approval_mode(args: list[str]) -> list[str]:
-    if has_approval_mode_arg(args):
-        return args
-    return ["--approval-mode", "yolo", *args]
-
-
-def read_available_fd(fd: int) -> tuple[bytes, bool]:
-    chunks: list[bytes] = []
-    eof = False
-    while True:
-        try:
-            data = os.read(fd, 4096)
-        except BlockingIOError:
-            break
-        except OSError:
-            eof = True
-            break
-        if not data:
-            eof = True
-            break
-        chunks.append(data)
-        if len(data) < 4096:
-            break
-    return b"".join(chunks), eof
-
-
-def run_attempt_with_output_timeout(
-    command: list[str],
-    stdin_text: str | None,
-    timeout: int,
-    cwd: Path | None,
-) -> dict[str, Any]:
-    env = os.environ.copy()
-    env["PATH"] = default_child_path()
-    proc = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=str(cwd) if cwd else None,
-        env=env,
-        close_fds=True,
-    )
-    stdout_chunks: list[str] = []
-    stderr_chunks: list[str] = []
-    streams: dict[int, str] = {}
-
-    assert proc.stdout is not None
-    assert proc.stderr is not None
-    for pipe, name in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
-        fd = pipe.fileno()
-        os.set_blocking(fd, False)
-        streams[fd] = name
-
-    if stdin_text is not None and proc.stdin is not None:
-        try:
-            proc.stdin.write(stdin_text.encode("utf-8"))
-            proc.stdin.flush()
-        except BrokenPipeError:
-            pass
-        finally:
-            proc.stdin.close()
-
-    last_output_at = time.time()
-    timed_out = False
-    try:
-        while True:
-            if not streams and proc.poll() is not None:
-                break
-
-            remaining = timeout - (time.time() - last_output_at)
-            if remaining <= 0:
-                timed_out = True
-                proc.terminate()
-                break
-
-            ready, _, _ = select.select(list(streams), [], [], min(0.25, remaining))
-            if ready:
-                for fd in ready:
-                    data, eof = read_available_fd(fd)
-                    if data:
-                        text = data.decode("utf-8", errors="replace")
-                        if streams.get(fd) == "stdout":
-                            stdout_chunks.append(text)
-                        elif streams.get(fd) == "stderr":
-                            stderr_chunks.append(text)
-                        last_output_at = time.time()
-                    if eof:
-                        streams.pop(fd, None)
-            elif proc.poll() is not None:
-                for fd in list(streams):
-                    data, eof = read_available_fd(fd)
-                    if data:
-                        text = data.decode("utf-8", errors="replace")
-                        if streams.get(fd) == "stdout":
-                            stdout_chunks.append(text)
-                        elif streams.get(fd) == "stderr":
-                            stderr_chunks.append(text)
-                        last_output_at = time.time()
-                    if eof:
-                        streams.pop(fd, None)
-                if not streams:
-                    break
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-    finally:
-        if proc.stdin is not None and not proc.stdin.closed:
-            proc.stdin.close()
-        if proc.stdout is not None:
-            proc.stdout.close()
-        if proc.stderr is not None:
-            proc.stderr.close()
-
-    return {
-        "timed_out": timed_out,
-        "returncode": proc.returncode,
-        "stdout": "".join(stdout_chunks),
-        "stderr": "".join(stderr_chunks),
-    }
-
-
-def try_gemini(prompt: str, timeout: int, cwd: Path | None) -> dict[str, Any]:
-    base_args = with_default_approval_mode(with_default_model(list(CONFIG.base_args)))
-    attempts = [
-        {
-            "strategy": "flag_-p",
-            "command": [CONFIG.gemini_bin, *base_args, "-p", prompt],
-            "stdin": None,
-        },
-        {
-            "strategy": "flag_--prompt",
-            "command": [CONFIG.gemini_bin, *base_args, "--prompt", prompt],
-            "stdin": None,
-        },
-        {
-            "strategy": "stdin",
-            "command": [CONFIG.gemini_bin, *base_args],
-            "stdin": prompt,
-        },
-    ]
-
-    failures: list[dict[str, Any]] = []
-    for attempt in attempts:
-        try:
-            completed = run_attempt_with_output_timeout(
-                command=attempt["command"],
-                stdin_text=attempt["stdin"],
-                timeout=timeout,
-                cwd=cwd,
-            )
-        except FileNotFoundError as exc:
-            raise BridgeError(
-                f"Gemini executable not found: {CONFIG.gemini_bin}",
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            ) from exc
-        if completed["timed_out"]:
-            raise BridgeError(
-                f"Gemini command produced no output for {timeout} seconds",
-                status_code=HTTPStatus.GATEWAY_TIMEOUT,
-            )
-
-        if completed["returncode"] == 0:
-            return {
-                "ok": True,
-                "strategy": attempt["strategy"],
-                "command": attempt["command"],
-                "cwd": str(cwd) if cwd else None,
-                "stdout": completed["stdout"].strip(),
-                "stderr": completed["stderr"].strip(),
-                "returncode": completed["returncode"],
-            }
-
-        failures.append(
-            {
-                "strategy": attempt["strategy"],
-                "command": attempt["command"],
-                "returncode": completed["returncode"],
-                "stdout": completed["stdout"].strip(),
-                "stderr": completed["stderr"].strip(),
-            }
-        )
-
-    return {
-        "ok": False,
-        "error": "All Gemini invocation strategies failed.",
-        "failures": failures,
-    }
+class BridgeError(Exception):
+    def __init__(self, message: str, status_code: int = HTTPStatus.BAD_REQUEST) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class GeminiBridgeHandler(BaseHTTPRequestHandler):
-    server_version = "GeminiBridge/0.1"
-
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/health":
-            self.write_json(
-                HTTPStatus.OK,
-                {
-                    "ok": True,
-                    "service": "gemini-bridge-server",
-                    "gemini_bin": CONFIG.gemini_bin,
-                    "workspace": str(REPO_ROOT),
-                    "workflow_root": str(AI_WORKFLOW_ROOT.relative_to(REPO_ROOT)),
-                    "registry_file": str(registry_file_path()),
-                    "daemon": DAEMON.status(),
-                },
-            )
+        if parsed.path == "/":
+            self.send_response(HTTPStatus.MOVED_PERMANENTLY)
+            self.send_header("Location", "/dashboard")
+            self.end_headers()
             return
-        if parsed.path in {"/", "/dashboard"}:
+        if parsed.path == "/dashboard":
             self.write_html(HTTPStatus.OK, dashboard_html())
             return
-        if parsed.path == "/jobs":
-            self.write_json(HTTPStatus.OK, {"ok": True, "jobs": list_jobs()})
+        if parsed.path == "/health":
+            self.write_json(HTTPStatus.OK, {"ok": True, "status": "healthy", "utc_now": utc_now()})
             return
         if parsed.path == "/registry":
-            self.write_json(
-                HTTPStatus.OK,
-                {
-                    "ok": True,
-                    "registry_file": str(registry_file_path()),
-                    "registry": read_registry(),
-                },
-            )
+            self.write_json(HTTPStatus.OK, {"ok": True, "registry": read_registry()})
             return
-        if parsed.path == "/projects":
+        if parsed.path == "/daemon/status":
+            self.write_json(HTTPStatus.OK, {"ok": True, "daemon": DAEMON.status()})
+            return
+        if parsed.path == "/platform-projects":
             registry = read_registry()
             self.write_json(HTTPStatus.OK, {"ok": True, "projects": registry.get("projects", {})})
             return
-        if parsed.path == "/agents":
+        if parsed.path == "/platform-agents":
             registry = read_registry()
             self.write_json(HTTPStatus.OK, {"ok": True, "agents": registry.get("agents", {})})
             return
@@ -1645,7 +1369,7 @@ class GeminiBridgeHandler(BaseHTTPRequestHandler):
             
             stdout_path = Path(str(detail["job"]["workspace"])) / detail["job"]["workflow_dir"] / "jobs" / job_id / "stdout.log"
             if not stdout_path.exists():
-                self.write_json(HTTPStatus.OK, {"ok": true, "content": "", "offset": 0})
+                self.write_json(HTTPStatus.OK, {"ok": True, "content": "", "offset": 0})
                 return
             
             with open(stdout_path, "r", encoding="utf-8", errors="replace") as f:
@@ -1666,31 +1390,11 @@ class GeminiBridgeHandler(BaseHTTPRequestHandler):
             if detail is None:
                 self.write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Platform job not found"})
                 return
-            self.write_json(HTTPStatus.OK, {"ok": True, **detail})
-            return
-        if parsed.path == "/daemon/status":
-            self.write_json(HTTPStatus.OK, {"ok": True, "daemon": DAEMON.status()})
-            return
-        if parsed.path.startswith("/jobs/"):
-            job_id = parsed.path.removeprefix("/jobs/").strip("/")
-            detail = job_detail(job_id)
-            if detail is None:
-                self.write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Job not found"})
-                return
-            self.write_json(HTTPStatus.OK, {"ok": True, **detail})
-            return
-        if parsed.path == "/gemini":
-            self.write_json(
-                HTTPStatus.GONE,
-                {
-                    "ok": False,
-                    "error": "Direct Gemini execution was removed. Use the async worker flow from MCP.",
-                },
-            )
+            self.write_json(HTTPStatus.OK, detail)
             return
         self.write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/daemon/start":
             DAEMON.set_enabled(True)
@@ -1765,6 +1469,226 @@ class GeminiBridgeHandler(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+def has_model_arg(args: list[str]) -> bool:
+    return any(
+        arg in {"--model", "-m"} or arg.startswith("--model=") or arg.startswith("-m=")
+        for arg in args
+    )
+
+
+def default_gemini_model() -> str:
+    return os.getenv("GEMINI_DEFAULT_MODEL", DEFAULT_GEMINI_MODEL)
+
+
+def with_default_model(args: list[str]) -> list[str]:
+    if has_model_arg(args):
+        return args
+    return ["--model", default_gemini_model(), *args]
+
+
+def has_approval_mode_arg(args: list[str]) -> bool:
+    return any(
+        arg == "--approval-mode" or arg.startswith("--approval-mode=") or arg in {"-y", "--yolo"}
+        for arg in args
+    )
+
+
+def with_default_approval_mode(args: list[str]) -> list[str]:
+    if has_approval_mode_arg(args):
+        return args
+    return ["--approval-mode", "yolo", *args]
+
+
+def read_available_fd(fd: int) -> tuple[bytes, bool]:
+    chunks: list[bytes] = []
+    eof = False
+    while True:
+        try:
+            data = os.read(fd, 4096)
+            if not data:
+                eof = True
+                break
+            chunks.append(data)
+        except (BlockingIOError, InterruptedError):
+            break
+        except OSError:
+            eof = True
+            break
+    return b"".join(chunks), eof
+
+
+def run_attempt_with_output_timeout(
+    command: list[str],
+    stdin_text: str | None,
+    timeout: int,
+    cwd: Path | None,
+) -> dict[str, Any]:
+    env = os.environ.copy()
+    env["PATH"] = default_child_path()
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        close_fds=True,
+    )
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    streams: dict[int, str] = {}
+
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    for pipe, name in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
+        fd = pipe.fileno()
+        os.set_blocking(fd, False)
+        streams[fd] = name
+
+    if stdin_text is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(stdin_text.encode("utf-8"))
+            proc.stdin.flush()
+        except BrokenPipeError:
+            pass
+        finally:
+            proc.stdin.close()
+
+    status = "completed"
+    last_output_at = time.time()
+    try:
+        while True:
+            if not streams and proc.poll() is not None:
+                break
+            remaining = timeout - (time.time() - last_output_at)
+            if remaining <= 0:
+                status = f"no output timeout after {timeout} seconds"
+                proc.terminate()
+                break
+            ready, _, _ = select.select(list(streams), [], [], min(0.25, remaining))
+            if ready:
+                for fd in ready:
+                    data, eof = read_available_fd(fd)
+                    if data:
+                        text = data.decode("utf-8", errors="replace")
+                        if streams.get(fd) == "stdout":
+                            stdout_chunks.append(text)
+                        else:
+                            stderr_chunks.append(text)
+                        last_output_at = time.time()
+                    if eof:
+                        streams.pop(fd, None)
+            elif proc.poll() is not None:
+                for fd in list(streams):
+                    data, eof = read_available_fd(fd)
+                    if data:
+                        text = data.decode("utf-8", errors="replace")
+                        if streams.get(fd) == "stdout":
+                            stdout_chunks.append(text)
+                        else:
+                            stderr_chunks.append(text)
+                    if eof:
+                        streams.pop(fd, None)
+                if not streams:
+                    break
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    finally:
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.stderr is not None:
+            proc.stderr.close()
+
+    return {
+        "ok": proc.returncode == 0,
+        "status": status,
+        "returncode": proc.returncode,
+        "stdout": "".join(stdout_chunks),
+        "stderr": "".join(stderr_chunks),
+    }
+
+
+def try_gemini(prompt: str, timeout: int, cwd: Path | None) -> dict[str, Any]:
+    base_args = with_default_approval_mode(with_default_model(list(CONFIG.base_args)))
+    attempts = [
+        {
+            "strategy": "flag_-p",
+            "command": [CONFIG.gemini_bin, *base_args, "-p", prompt],
+            "stdin": None,
+        },
+        {
+            "strategy": "flag_--prompt",
+            "command": [CONFIG.gemini_bin, *base_args, "--prompt", prompt],
+            "stdin": None,
+        },
+        {
+            "strategy": "stdin",
+            "command": [CONFIG.gemini_bin, *base_args],
+            "stdin": prompt,
+        },
+    ]
+
+    failures: list[dict[str, Any]] = []
+    for attempt in attempts:
+        try:
+            completed = run_attempt_with_output_timeout(
+                command=list(attempt["command"]),
+                stdin_text=attempt["stdin"],
+                timeout=timeout,
+                cwd=cwd,
+            )
+        except FileNotFoundError:
+            return {"ok": False, "error": f"Gemini binary not found: {CONFIG.gemini_bin}"}
+
+        if completed["ok"]:
+            return {
+                "ok": True,
+                "strategy": attempt["strategy"],
+                "command": attempt["command"],
+                "returncode": completed["returncode"],
+                "stdout": completed["stdout"],
+                "stderr": completed["stderr"],
+            }
+        failures.append(
+            {
+                "strategy": attempt["strategy"],
+                "command": attempt["command"],
+                "returncode": completed["returncode"],
+                "stdout": completed["stdout"],
+                "stderr": completed["stderr"],
+            }
+        )
+
+    return {"ok": False, "error": "All attempts failed", "failures": failures}
+
+
+def build_payload(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
+    content_length = int(handler.headers.get("content-length", 0))
+    if not content_length:
+        return {}
+    return json.loads(handler.rfile.read(content_length).decode("utf-8"))
+
+
+def normalize_request(payload: dict[str, Any]) -> tuple[str, int, Path | None]:
+    prompt = str(payload.get("prompt", "")).strip()
+    if not prompt:
+        raise BridgeError("Prompt is required")
+    timeout = env_int("GEMINI_TIMEOUT_SECONDS", 360)
+    if payload.get("timeout"):
+        try:
+            timeout = int(payload["timeout"])
+        except ValueError:
+            pass
+    cwd = None
+    if payload.get("cwd"):
+        cwd = Path(str(payload["cwd"])).expanduser().resolve()
+    return prompt, timeout, cwd
 
 
 def main() -> None:

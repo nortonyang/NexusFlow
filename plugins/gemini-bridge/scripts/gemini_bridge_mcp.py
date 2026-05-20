@@ -213,6 +213,8 @@ def default_child_path() -> str:
 
 def build_child_env() -> dict[str, str]:
     child_env = os.environ.copy()
+
+    # Ensure the child process has a good PATH for tools like ripgrep
     child_env["PATH"] = default_child_path()
 
     gemini_home = default_gemini_home()
