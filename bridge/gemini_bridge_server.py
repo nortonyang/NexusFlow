@@ -772,7 +772,7 @@ def dashboard_html() -> str:
       <div class="logo-icon">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
       </div>
-      <span>NexusFlow Console Pro</span>
+      <span id="header-project-name">NexusFlow Console Pro</span>
     </div>
     <div class="header-actions">
       <div class="daemon-badge">
@@ -926,7 +926,9 @@ def dashboard_html() -> str:
       selectedJobId: null,
       jobDetail: null,
       activeTab: 'Overview',
-      daemon: {}
+      daemon: {},
+      logOffset: 0,
+      logContent: ""
     };
 
     function t(key) {
@@ -998,6 +1000,9 @@ def dashboard_html() -> str:
     async function refreshAll() {
       try {
         await Promise.all([refreshRegistry(), refreshDaemon(), refreshJobs()]);
+        if (state.selectedJobId && state.activeTab === t("tab_console")) {
+            await fetchIncrementalLogs();
+        }
         render();
       } catch (e) { console.error('Refresh failed', e); }
     }
@@ -1028,6 +1033,8 @@ def dashboard_html() -> str:
     async function selectJob(jobId) {
       state.selectedJobId = jobId;
       state.jobDetail = null;
+      state.logOffset = 0;
+      state.logContent = "";
       render();
       
       const res = await fetch(`/platform-jobs/${jobId}`);
@@ -1035,6 +1042,23 @@ def dashboard_html() -> str:
         state.jobDetail = await res.json();
         render();
       }
+    }
+
+    async function fetchIncrementalLogs() {
+      if (!state.selectedJobId || state.activeTab !== t(tab_console)) return;
+      try {
+        const res = await fetch(`/platform-jobs/${state.selectedJobId}/logs?offset=${state.logOffset}`);
+        const data = await res.json();
+        if (data.ok && (data.content || data.offset > state.logOffset)) {
+          state.logContent += data.content || "";
+          state.logOffset = data.offset;
+          const codeBlock = document.getElementById("log-code-block");
+          if (codeBlock) {
+            codeBlock.textContent = state.logContent;
+            codeBlock.scrollTop = codeBlock.scrollHeight;
+          }
+        }
+      } catch (e) { console.error("Log fetch failed", e); }
     }
 
     async function postAction(path) {
@@ -1053,7 +1077,11 @@ def dashboard_html() -> str:
     }
 
     function render() {
-      document.title = state.lang === 'zh' ? 'Gemini Bridge 控制台' : 'Gemini Bridge Console';
+      const projName = state.selectedProject || 'NexusFlow';
+      document.title = state.lang === 'zh' ? `${projName} 控制台` : `${projName} Console`;
+      const headerTitle = document.getElementById('header-project-name');
+      if (headerTitle) headerTitle.textContent = `${projName} Console Pro`;
+
       document.getElementById('btn-refresh-text').textContent = t('refresh');
       document.getElementById('sidebar-title').textContent = t('projects');
       document.getElementById('queue-pane-title').textContent = t('queue');
@@ -1198,7 +1226,7 @@ def dashboard_html() -> str:
         case 'tab_prompt':
           return `<pre class="code-block">${escapeHtml(data.status?.prompt || data.job?.prompt || '-')}</pre>`;
         case 'tab_console':
-          return `<pre class="code-block">${escapeHtml(data.stdout_tail || t('no_output'))}</pre>`;
+          return `<pre id="log-code-block" class="code-block" style="height:500px; overflow-y:auto;">${escapeHtml(state.logContent || t('no_output'))}</pre>`;
         case 'tab_patch':
           return `<pre class="code-block">${escapeHtml(data.result_tail || t('no_result'))}</pre>`;
         case 'tab_json':
@@ -1590,6 +1618,32 @@ class GeminiBridgeHandler(BaseHTTPRequestHandler):
         if parsed.path == "/platform-jobs":
             self.write_json(HTTPStatus.OK, {"ok": True, "jobs": list_platform_jobs()})
             return
+        if parsed.path.startswith("/platform-jobs/") and parsed.path.endswith("/logs"):
+            job_id = parsed.path.removeprefix("/platform-jobs/").removesuffix("/logs").strip("/")
+            query = parse_qs(parsed.query)
+            offset = int(query.get("offset", ["0"])[0])
+            detail = platform_job_detail(job_id)
+            if not detail:
+                self.write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Job not found"})
+                return
+            
+            stdout_path = Path(str(detail["job"]["workspace"])) / detail["job"]["workflow_dir"] / "jobs" / job_id / "stdout.log"
+            if not stdout_path.exists():
+                self.write_json(HTTPStatus.OK, {"ok": true, "content": "", "offset": 0})
+                return
+            
+            with open(stdout_path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(0, os.SEEK_END)
+                file_size = f.tell()
+                if offset > file_size:
+                    offset = file_size
+                f.seek(offset)
+                content = f.read(10000) # Read up to 10KB
+                new_offset = f.tell()
+                
+            self.write_json(HTTPStatus.OK, {"ok": True, "content": content, "offset": new_offset, "total_size": file_size})
+            return
+
         if parsed.path.startswith("/platform-jobs/"):
             job_id = parsed.path.removeprefix("/platform-jobs/").strip("/")
             detail = platform_job_detail(job_id)
