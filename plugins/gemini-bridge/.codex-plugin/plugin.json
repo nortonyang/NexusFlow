@@ -1,0 +1,45 @@
+{
+  "name": "nexus-flow",
+  "version": "0.1.0",
+  "description": "Expose local AI Agents as Codex App MCP tools.",
+  "author": {
+    "name": "NortonYang"
+  },
+  "homepage": "https://github.com/NortonYang/NexusFlow",
+  "repository": "https://github.com/NortonYang/NexusFlow",
+  "license": "MIT",
+  "keywords": [
+    "nexus",
+    "flow",
+    "agent",
+    "mcp",
+    "codex",
+    "ai",
+    "bridge"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "NexusFlow",
+    "shortDescription": "Orchestrate AI Agents through MCP",
+    "longDescription": "NexusFlow provides a unified bridge for AI agents, enabling asynchronous workflow dispatching and task management.",
+    "developerName": "NortonYang",
+    "category": "Engineering",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/NortonYang/NexusFlow",
+    "privacyPolicyURL": "https://github.com/NortonYang/NexusFlow/privacy",
+    "termsOfServiceURL": "https://github.com/NortonYang/NexusFlow/terms",
+    "defaultPrompt": [
+      "Use NexusFlow to summarize this repository.",
+      "Ask NexusFlow to review this code path.",
+      "Use NexusFlow to explain this error."
+    ],
+    "brandColor": "#2563EB",
+    "composerIcon": "./assets/gemini-bridge.svg",
+    "logo": "./assets/gemini-bridge.svg",
+    "screenshots": []
+  }
+}

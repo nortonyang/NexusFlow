@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "gemini-bridge": {
+      "command": "python3",
+      "args": [
+        "./scripts/gemini_bridge_mcp.py"
+      ],
+      "cwd": ".",
+      "env": {}
+    }
+  }
+}

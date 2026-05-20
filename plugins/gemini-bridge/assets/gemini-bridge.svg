@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Gemini Bridge">
+  <rect width="128" height="128" rx="24" fill="#0f172a"/>
+  <path d="M32 64c18-2 30-14 32-32 2 18 14 30 32 32-18 2-30 14-32 32-2-18-14-30-32-32z" fill="#60a5fa"/>
+  <path d="M64 20l6 14 14 6-14 6-6 14-6-14-14-6 14-6 6-14z" fill="#e0f2fe"/>
+  <path d="M88 78h12v12H88zM28 38h12v12H28z" fill="#93c5fd"/>
+</svg>
